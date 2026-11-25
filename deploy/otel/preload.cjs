@@ -17,8 +17,7 @@
 
     const base = (process.env.OTEL_EXPORTER_OTLP_ENDPOINT || "http://otel-collector:4318").replace(/\/$/, "");
     const TIMEOUT = 2000; // fail-open: exporter gives up fast; bounded queue drops when full
-    const CAPTURE = process.env.OMNIROUTE_OTEL_CAPTURE_BODIES === "true"; // opt-in
-    const MAX_BODY = 16384;
+    const CAPTURE = /^(1|true)$/i.test(process.env.OMNIROUTE_OTEL_CAPTURE_BODIES || ""); // opt-in
 
     const resource = resourceFromAttributes({
       "service.name": process.env.OTEL_SERVICE_NAME || "omniroute",
@@ -70,9 +69,8 @@
 
     const httpInst = new HttpInstrumentation({
       ignoreIncomingRequestHook: (req) => !isLlm(stripPath(req.url)),
-      requestHook(span, info) {
+      requestHook(span, request) {
         try {
-          const request = info.request;
           if (!request || request.method !== "POST" || typeof request.push !== "function") return;
           if (!isLlm(stripPath(request.url))) return;
           const st = { req: [], reqLen: 0, res: [], resLen: 0 };
@@ -101,18 +99,23 @@
           };
           res.write = function (c) { try { tap(c); } catch (_) {} return w.apply(this, arguments); };
           res.end = function (c) { try { tap(c); } catch (_) {} return e.apply(this, arguments); };
-          res.once("close", () => {
+          let done = false;
+          const finish = () => {
+            if (done) return; done = true;
             try {
               const reqBody = tryJson(Buffer.concat(st.req).toString("utf8")) || {};
               const text = Buffer.concat(st.res).toString("utf8");
               const out = parseResponse(text);
-              const A = { "gen_ai.operation.name": op, "gen_ai.system": "omniroute", "omniroute.route": path };
+              const A = { "gen_ai.operation.name": op, "omniroute.route": path };
               if (reqBody.model) A["gen_ai.request.model"] = String(reqBody.model);
               if (out.model) A["gen_ai.response.model"] = String(out.model);
               if (out.in != null) A["gen_ai.usage.input_tokens"] = out.in;
               if (out.out != null) A["gen_ai.usage.output_tokens"] = out.out;
               const prov = hdr(res, "x-omniroute-provider");
+              A["gen_ai.provider.name"] = prov || "omniroute";
               if (prov) A["omniroute.provider"] = prov;
+              const ff = hdr(res, "x-omniroute-fallback-from");
+              if (ff) A["omniroute.fallback_from"] = ff;
               const fb = hdr(res, "x-omniroute-fallback-attempts");
               if (fb != null) { A["omniroute.fallback"] = Number(fb) > 0; A["omniroute.fallback_attempts"] = Number(fb) || 0; }
               const cost = parseFloat(hdr(res, "x-omniroute-response-cost"));
@@ -122,17 +125,18 @@
               if (CAPTURE) {
                 logger.emit({
                   severityNumber: SeverityNumber.INFO,
-                  body: "llm.exchange",
-                  attributes: {
-                    "gen_ai.request.model": A["gen_ai.request.model"] || "",
-                    "gen_ai.prompt": JSON.stringify(reqBody.messages || reqBody.input || reqBody.prompt || "").slice(0, MAX_BODY),
-                    "gen_ai.completion": text.slice(0, MAX_BODY),
-                  },
+                  body: JSON.stringify({
+                    prompt: reqBody.messages || reqBody.input || reqBody.prompt || null,
+                    completion: text,
+                  }),
+                  attributes: { "gen_ai.request.model": A["gen_ai.request.model"] || "" },
                   context: trace.setSpan(context.active(), span),
                 });
               }
             } catch (_) {}
-          });
+          };
+          res.prependOnceListener("finish", finish);
+          res.prependOnceListener("close", finish);
         } catch (_) {}
       },
     });
